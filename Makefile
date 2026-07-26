@@ -63,6 +63,7 @@ test:
 	    -f tests/30_eligibility_test.sql \
 	    -f tests/40_reconciliation_test.sql \
 	    -f tests/50_channel_scoping_test.sql \
+	    -f tests/60_suppression_list_test.sql \
 	    -f tests/99_report.sql
 
 # Idempotence, checked rather than claimed. Issue 07 requires that running the

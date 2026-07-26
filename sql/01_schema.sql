@@ -26,6 +26,8 @@ DROP SCHEMA IF EXISTS config  CASCADE;
 -- Only the tables are named here. Every derived view in sql/03..07 hangs off
 -- one of them, so CASCADE takes them all — and a hand-maintained list of view
 -- names is a list that silently drifts as views are added.
+DROP TABLE IF EXISTS suppression_list      CASCADE;
+DROP TABLE IF EXISTS suppression_reason    CASCADE;
 DROP TABLE IF EXISTS experiment_enrollment CASCADE;
 DROP TABLE IF EXISTS experiment            CASCADE;
 DROP TABLE IF EXISTS contact_event         CASCADE;
@@ -448,9 +450,33 @@ CREATE TABLE crm_lifecycle (
 CREATE TABLE experiment (
     experiment_id     uuid PRIMARY KEY,
     name              text NOT NULL UNIQUE,
+
+    -- 05: the only *free* dimension. Three free dimensions is 6 x 3 x 4 = 72
+    -- cells against 723 contactable people, which is ten per cell — not an
+    -- experiment. One dimension varies, the rest are held fixed.
     message_variant   text NOT NULL,
-    segment           text,        -- awaits 05
-    persona           text,        -- awaits 05
+
+    -- Held fixed unless they are the thing being tested. NULL here and in 07's
+    -- seeded row on purpose: 03 found `industry` is contact-level noise, so
+    -- segment must be assigned by a human at the company, and inventing one to
+    -- fill the column would fabricate the input the learning loop depends on.
+    segment           text,
+    persona           text,
+
+    -- 09: audience is a partition *above* this model — a property of why you
+    -- are approaching someone, not of who they are. The same editor is a
+    -- publisher target this quarter and a brand target next quarter, so putting
+    -- it on the person would mean rewriting people when the pitch changes.
+    audience          text NOT NULL DEFAULT 'brand'
+                      CHECK (audience IN ('brand', 'publisher')),
+
+    -- 05: declared before the experiment runs, never chosen afterwards. A
+    -- metric picked after the numbers are in is how 2.6% becomes whatever the
+    -- deck needs. Also the field that records which rates are even readable:
+    -- at this volume `booked` is not, and `replied` barely is.
+    success_metric    text NOT NULL DEFAULT 'replied'
+                      CHECK (success_metric IN ('replied', 'replied_positive', 'booked')),
+
     channels          text[] NOT NULL,
     max_duration_days int NOT NULL DEFAULT 30
 );
@@ -467,7 +493,109 @@ CREATE TABLE experiment_enrollment (
 
 
 -- =============================================================================
---  7. The rule table (04 §7)
+--  7. The suppression list — asserted exclusions (brief: "partner conflicts")
+-- =============================================================================
+--
+--  Every other suppression in this model is *derived*: from the event log, from
+--  the HubSpot lifecycle projection, from the notes field. Three of the brief's
+--  four named suppression sources work that way — customers and open
+--  opportunities come from HubSpot, do-not-contact requests come from a human
+--  sentence in `notes`.
+--
+--  Partner conflicts do not. Nothing in the data expresses "we may not approach
+--  this account because a partner owns it": it is a fact that lives in a
+--  person's head, or in a signed agreement, and it reaches the system only
+--  because somebody writes it down. That makes it a different *kind* of
+--  suppression, and it needs a table rather than a predicate.
+--
+--  Which means the honest version of this table is defined by its writer, not
+--  its rows. `added_by` is NOT NULL for that reason: an asserted-suppression
+--  list with no accountable author is the mechanism by which someone's
+--  ex-colleague's grudge quietly removes an account for two years. The rows are
+--  cheap; the write path — who may add, who reviews, what expires — is the part
+--  that costs something, and it is named in SUBMISSION.md as a designed-not-
+--  built item.
+--
+--  It is seeded EMPTY, deliberately. There is no partner-relationship field in
+--  the CSV, and inferring one from `source = 'partner_referral'` (123 rows)
+--  would be wrong in the most expensive direction: a partner *referral* is a
+--  warm introduction, close to the opposite of a partner *conflict*. So the
+--  constraint is answered with a mechanism that demonstrably works, on zero
+--  rows, rather than with a number invented to look thorough. tests/60 inserts
+--  fixtures and proves the rules bite.
+--
+--  This is also where `suppression_override` lands when it is built — the
+--  inverse table, letting a deal owner re-open a named person inside an
+--  otherwise-frozen open-opportunity account. Same shape, same writer problem,
+--  worth ~900 people. Cut for now; see SUBMISSION.md.
+
+-- The reason catalogue. Reasons are data, so a new one is an INSERT rather than
+-- a migration — and the eligibility rules below are generated from this table,
+-- exactly as the recycle windows are, so a reason can never exist without a
+-- rule name that the rejection ledger is allowed to cite.
+CREATE TABLE suppression_reason (
+    reason        text PRIMARY KEY,
+    precedence    int  NOT NULL UNIQUE,
+    default_scope text NOT NULL CHECK (default_scope IN ('person', 'company')),
+    rationale     text NOT NULL
+);
+
+INSERT INTO suppression_reason (reason, precedence, default_scope, rationale) VALUES
+    ('partner_conflict', 1, 'company',
+     'Named by the brief. A partner owns the account, or a reseller agreement '
+     'forbids direct approach. Company-scoped by default because partner '
+     'agreements are written about accounts, not individuals.'),
+
+    ('legal_hold', 2, 'person',
+     'Counsel or a GDPR Art.17 erasure request. Person-scoped and permanent. '
+     'Distinct from person:dnc because its origin is a legal instrument rather '
+     'than a prospect saying stop, and it must survive a re-import that would '
+     'overwrite the notes field the DNC rule reads.'),
+
+    ('manual', 3, 'person',
+     'The escape hatch, and deliberately last of the three: anything a human '
+     'needs excluded today that the model has no vocabulary for yet. Every '
+     'entry here is a request for a real reason to be added above it.');
+
+CREATE TABLE suppression_list (
+    suppression_id uuid PRIMARY KEY,
+    reason         text NOT NULL REFERENCES suppression_reason(reason),
+    scope          text NOT NULL CHECK (scope IN ('person', 'company')),
+    person_id      uuid REFERENCES person(person_id),
+    company_id     uuid REFERENCES company(company_id),
+
+    -- The accountable author. Not nullable, and not defaulted to a system name:
+    -- an assertion nobody signed is an assertion nobody will ever remove.
+    added_by       text NOT NULL,
+    added_at       date NOT NULL,
+
+    -- NULL means permanent. A partner agreement that lapses in March should
+    -- stop suppressing in March without anyone remembering to delete a row,
+    -- and it is read against config.as_of() like every other clock here.
+    expires_at     date,
+
+    evidence       jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Scope and target must agree. A company-scoped row carrying a person_id
+    -- would suppress either one person or three hundred depending on which
+    -- half of the predicate a future reader trusted.
+    CONSTRAINT scope_matches_target CHECK (
+        (scope = 'person'  AND person_id  IS NOT NULL AND company_id IS NULL) OR
+        (scope = 'company' AND company_id IS NOT NULL AND person_id  IS NULL))
+);
+
+CREATE INDEX ON suppression_list (person_id);
+CREATE INDEX ON suppression_list (company_id);
+
+COMMENT ON TABLE suppression_list IS
+    'Asserted suppression: the exclusions a human writes down because no data '
+    'source emits them. Empty on this dataset by design — there is no partner '
+    'relationship field in the CSV and source=partner_referral means the '
+    'opposite. tests/60 proves the rules fire.';
+
+
+-- =============================================================================
+--  8. The rule table (04 §7)
 -- =============================================================================
 --
 --  The rules are data, not code branches. Precedence is a column, so the order
@@ -510,41 +638,41 @@ CREATE TABLE eligibility_rule (
 );
 
 INSERT INTO eligibility_rule (rule_name, precedence, scope, duration, origin, rationale) VALUES
- ('person:dnc', 1, 'person', 'permanent', 'notes free text',
+ ('person:dnc', 4, 'person', 'permanent', 'notes free text',
   'A human sentence is a stronger signal than a click, so an explicit removal '
   'request is global across every channel, not channel-scoped like an unsubscribe.'),
 
- ('person:unsubscribed', 2, 'person', 'permanent, channel-scoped', 'Instantly / HeyReach webhook',
+ ('person:unsubscribed', 5, 'person', 'permanent, channel-scoped', 'Instantly / HeyReach webhook',
   'Channel-scoped because that is what CAN-SPAM and GDPR Art.21 actually '
   'regulate. Stated assumption: a stricter counsel reading globalises all 29 '
   'unsubscribes at a cost of 8 people.'),
 
- ('person:bounced', 3, 'person', 'permanent, address-scoped', 'Instantly webhook',
+ ('person:bounced', 6, 'person', 'permanent, address-scoped', 'Instantly webhook',
   'Every bounce is terminal for that address. 01 established Instantly exposes '
   'no bounce-type field, and inferring severity from repetition requires '
   're-sending to a possibly-dead address to learn whether it is dead — which is '
   'exactly the behaviour that burns a sending domain. The person survives on '
   'LinkedIn and on any future address.'),
 
- ('company:customer', 4, 'company', 'permanent', 'HubSpot lifecycle',
+ ('company:customer', 7, 'company', 'permanent', 'HubSpot lifecycle',
   'Company-wide. Cold outbound into an existing account reads as a failure of '
   'basic record-keeping to the customer receiving it.'),
 
- ('company:open_opportunity', 5, 'company', 'while open, +90d after close-lost', 'HubSpot lifecycle',
+ ('company:open_opportunity', 8, 'company', 'while open, +90d after close-lost', 'HubSpot lifecycle',
   'Company-wide, and the single largest input to eligible volume — 47% of the '
   'list sits at a company with an open deal. Suppressing only the named buying '
   'committee was worth ~910 more people and was rejected on asymmetry: a cold '
   'sequence landing mid-negotiation can cost a deal in flight, while a '
   'suppressed prospect costs only delay.'),
 
- ('person:owned_by_sales', 6, 'person', 'until sales releases', 'Instantly / HubSpot',
+ ('person:owned_by_sales', 9, 'person', 'until sales releases', 'Instantly / HubSpot',
   'booked or replied_positive. Outbound does not own this person any more.'),
 
- ('identity:needs_review', 10, 'identity', 'until adjudicated', '03 R3-uncorroborated',
+ ('identity:needs_review', 13, 'identity', 'until adjudicated', '03 R3-uncorroborated',
   'Both members of an ambiguous cluster are held. The system is visibly aware '
   'of its own uncertainty rather than silently guessing.'),
 
- ('person:in_live_experiment', 11, 'person', 'until terminal event or expiry', 'ledger',
+ ('person:in_live_experiment', 14, 'person', 'until terminal event or expiry', 'ledger',
   'The ledger is the enforcement point. 01 established Instantly creates '
   'duplicate lead rows across campaigns unless skip_if_in_* is set, and those '
   'vendor flags are defence in depth only.'),
@@ -559,19 +687,39 @@ INSERT INTO eligibility_rule (rule_name, precedence, scope, duration, origin, ra
  -- Last in precedence because it is the least permanent reason on the list:
  -- it is a property of the experiment, not of the person, and it disappears
  -- the moment the same person is put in a LinkedIn sequence.
- ('person:unreachable_on_channel', 12, 'person', 'for this experiment only', 'derived',
+ ('person:unreachable_on_channel', 15, 'person', 'for this experiment only', 'derived',
   'No channel in the experiment is usable for this person: no valid email '
   'address for an email step, or an unsubscribe or bounce covering every '
   'channel the experiment uses.');
 
--- Rules 7-9 are generated from recycle_window so the day counts cannot be
+-- Rules 10-12 are generated from recycle_window so the day counts cannot be
 -- stated in one place and enforced from another.
 INSERT INTO eligibility_rule (rule_name, precedence, scope, duration, origin, rationale)
 SELECT 'person:recycle_window(' || w.outcome || ')',
        v.precedence, 'person', w.window_days || ' days', 'derived', w.rationale
-  FROM (VALUES ('no_reply', 7), ('replied_negative', 8), ('opened_no_reply', 9))
+  FROM (VALUES ('no_reply', 10), ('replied_negative', 11), ('opened_no_reply', 12))
        AS v(outcome, precedence)
   JOIN recycle_window w USING (outcome);
+
+-- Rules 1-3 are generated from suppression_reason, the same way, and take the
+-- top of the precedence order.
+--
+-- Asserted suppression outranks every derived rule, including person:dnc. Not
+-- because it is more permanent — both are permanent — but because the ledger
+-- names the single most *meaningful* reason a person was excluded, and "a
+-- partner owns this account, asserted by a named human on a date" is a better
+-- answer to "why is this account cold?" than a regex over a notes field. The
+-- ordering has no effect on volume: a person who fires both is rejected either
+-- way. It only changes what the rejection ledger says, which is the artifact
+-- someone actually has to argue with.
+INSERT INTO eligibility_rule (rule_name, precedence, scope, duration, origin, rationale)
+SELECT 'list:' || s.reason,
+       s.precedence,
+       s.default_scope,
+       'until removed or expires_at',
+       'suppression_list, written by a human',
+       s.rationale
+  FROM suppression_reason s;
 
 COMMENT ON TABLE eligibility_rule IS
     'company:domain_lock is deliberately absent. Under grandfather-and-converge '

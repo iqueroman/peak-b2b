@@ -33,8 +33,43 @@ SELECT norm.surrogate('experiment', config.experiment()), config.experiment(), '
 DROP VIEW IF EXISTS rule_fired CASCADE;
 CREATE VIEW rule_fired AS
 
--- 1. person:dnc — a human sentence, global across every channel, permanent.
-SELECT h.person_id, 'person:dnc'::text AS rule_name,
+-- 1-3. list:<reason> — asserted suppression. The brief names partner conflicts
+--       alongside customers, open opportunities and DNC requests; this is the
+--       one of the four that no data source emits, so it is the one that needs
+--       a table (schema §7) rather than a predicate over the log.
+--
+--       One block covers all three reasons because the predicate is identical
+--       and only the reason differs — the same reason the two company lifecycle
+--       rules share a block below.
+--
+--       Company-scoped entries expand to every person at the company, which is
+--       the whole point: a partner agreement is written about an account, and
+--       `kindredgroup.io` has 37 contacts. Person-scoped entries hit one human.
+--
+--       Fires for nobody on this dataset, because the table is empty and
+--       inventing rows would be worse than an empty table honestly labelled
+--       (see schema §7 on why source=partner_referral is not this). tests/60
+--       inserts fixtures at both scopes, checks the expiry clock reads as_of
+--       rather than now(), and checks these rules outrank company:customer.
+SELECT p.person_id, ('list:' || s.reason)::text AS rule_name,
+       jsonb_build_object('scope', s.scope,
+                          'company', c.primary_domain,
+                          'added_by', s.added_by,
+                          'added_at', s.added_at,
+                          'expires_at', s.expires_at,
+                          'asserted_evidence', s.evidence) AS evidence
+  FROM suppression_list s
+  JOIN person p ON (s.scope = 'person'  AND p.person_id  = s.person_id)
+                OR (s.scope = 'company' AND p.company_id = s.company_id)
+  LEFT JOIN company c ON c.company_id = p.company_id
+ -- Read against as_of, like every other clock here, so a lapsed partner
+ -- agreement stops suppressing on its own and the run stays reproducible.
+ WHERE s.expires_at IS NULL OR s.expires_at > config.as_of()
+
+UNION ALL
+
+-- 4. person:dnc — a human sentence, global across every channel, permanent.
+SELECT h.person_id, 'person:dnc',
        jsonb_build_object('source', 'notes free text',
                           'note', (SELECT string_agg(DISTINCT c.notes, '; ')
                                      FROM landing.contact_csv c
@@ -46,7 +81,7 @@ SELECT h.person_id, 'person:dnc'::text AS rule_name,
 
 UNION ALL
 
--- 2. person:unsubscribed — channel-scoped, permanent.
+-- 5. person:unsubscribed — channel-scoped, permanent.
 --
 --    Stated assumption: an email unsubscribe kills email and a LinkedIn
 --    withdrawal kills LinkedIn, matching what CAN-SPAM and GDPR Art.21 actually
@@ -65,13 +100,13 @@ SELECT h.person_id, 'person:unsubscribed',
    -- Deliberately NOT available_channels(): this rule asks only whether the
    -- unsubscribes cover every channel. Folding in the email/bounce checks would
    -- reject someone for having no address under the name "unsubscribed", which
-   -- is a different fact and belongs to rule 12.
+   -- is a different fact and belongs to rule 15.
    AND NOT EXISTS (SELECT 1 FROM unnest(x.channels) ch
                     WHERE ch <> ALL (h.unsubscribed_channels))
 
 UNION ALL
 
--- 3. person:bounced — terminal for that address, not for the person.
+-- 6. person:bounced — terminal for that address, not for the person.
 --
 --    01 established Instantly exposes one email_bounced event with no type
 --    field, so severity is unavailable. Inferring it from repetition was
@@ -102,7 +137,7 @@ SELECT h.person_id, 'person:bounced',
 
 UNION ALL
 
--- 4-5. company:customer and company:open_opportunity — both company-wide.
+-- 7-8. company:customer and company:open_opportunity — both company-wide.
 --
 --    One block over two stages, because the predicate is identical and only the
 --    HubSpot lifecycle stage differs. Writing it twice would be two places to
@@ -149,7 +184,7 @@ SELECT p.person_id, g.rule_name,
 
 UNION ALL
 
--- 6. person:owned_by_sales — booked or replied positive. Outbound does not own
+-- 9. person:owned_by_sales — booked or replied positive. Outbound does not own
 --    this person any more, and only sales can release them.
 SELECT h.person_id, 'person:owned_by_sales',
        jsonb_build_object('last_sent_at', h.last_sent_at,
@@ -162,7 +197,7 @@ SELECT h.person_id, 'person:owned_by_sales',
 
 UNION ALL
 
--- 7-9. person:recycle_window(...) — elapsed time since the last send.
+-- 10-12. person:recycle_window(...) — elapsed time since the last send.
 --
 --    The asymmetry is the defensible part: someone who opened and stayed
 --    silent is *warmer* than someone who ignored you entirely, so they come
@@ -187,7 +222,7 @@ SELECT lo.person_id,
 
 UNION ALL
 
--- 10. identity:needs_review — 03's R3-uncorroborated clusters. Both members
+-- 13. identity:needs_review — 03's R3-uncorroborated clusters. Both members
 --     are held until a human adjudicates. This is the system being visibly
 --     aware of its own uncertainty rather than silently guessing.
 SELECT p.person_id, 'identity:needs_review', p.review_evidence
@@ -196,7 +231,7 @@ SELECT p.person_id, 'identity:needs_review', p.review_evidence
 
 UNION ALL
 
--- 11. person:in_live_experiment — the brief's one-live-experiment rule.
+-- 14. person:in_live_experiment — the brief's one-live-experiment rule.
 --
 --     A multi-channel sequence is NOT two experiments; it is one experiment
 --     whose definition contains both an email step and a LinkedIn step. That
@@ -226,7 +261,7 @@ SELECT en.person_id, 'person:in_live_experiment',
 
 UNION ALL
 
--- 12. person:unreachable_on_channel — nothing left to send on.
+-- 15. person:unreachable_on_channel — nothing left to send on.
 --
 --     Not one of 04's rules. 04 enumerates ten reasons a person must not be
 --     contacted and none for a person who simply cannot be. On the default
@@ -319,6 +354,7 @@ SELECT l.person_id,
        CASE
            WHEN p.needs_review                        THEN 'held'
            WHEN l.rule_name LIKE 'company:%'
+             OR l.rule_name LIKE 'list:%'
              OR l.rule_name IN ('person:dnc', 'person:unsubscribed',
                                 'person:bounced')     THEN 'suppressed'
            WHEN l.rule_name = 'person:owned_by_sales' THEN 'responded'
