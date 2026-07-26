@@ -1,0 +1,26 @@
+# Postgres for the send-eligible pipeline.
+#
+# Pinned to 16 because that is what the pipeline was developed and tested
+# against. Nothing here needs an extension: identity resolution uses explicit
+# normalisation functions rather than citext, and ids are derived with md5
+# rather than pgcrypto, so this runs on a stock image with no build step.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: noble-sor-db
+    environment:
+      POSTGRES_USER: noble
+      POSTGRES_PASSWORD: noble
+      POSTGRES_DB: noble
+    ports:
+      # 5433 on the host, so this never collides with a Postgres someone is
+      # already running on 5432.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noble -d noble"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # No volume. The pipeline rebuilds everything from the CSV on every run, so
+    # persisting the data directory would only create a way for a stale run to
+    # survive and be mistaken for a fresh one.
