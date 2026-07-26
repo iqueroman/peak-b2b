@@ -513,7 +513,7 @@ CREATE TABLE experiment_enrollment (
 --  list with no accountable author is the mechanism by which someone's
 --  ex-colleague's grudge quietly removes an account for two years. The rows are
 --  cheap; the write path — who may add, who reviews, what expires — is the part
---  that costs something, and it is named in SUBMISSION.md as a designed-not-
+--  that costs something, and it is named in README.md as a designed-not-
 --  built item.
 --
 --  It is seeded EMPTY, deliberately. There is no partner-relationship field in
@@ -527,7 +527,7 @@ CREATE TABLE experiment_enrollment (
 --  This is also where `suppression_override` lands when it is built — the
 --  inverse table, letting a deal owner re-open a named person inside an
 --  otherwise-frozen open-opportunity account. Same shape, same writer problem,
---  worth ~900 people. Cut for now; see SUBMISSION.md.
+--  worth ~900 people. Cut for now; see README.md.
 
 -- The reason catalogue. Reasons are data, so a new one is an INSERT rather than
 -- a migration — and the eligibility rules below are generated from this table,
