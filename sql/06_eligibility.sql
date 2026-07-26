@@ -158,7 +158,8 @@ UNION ALL
 --
 --    Coordinated multi-threading is the correct end state, via a
 --    suppression_override table with a deal-owner as its writer. Designed, not
---    built — inside four hours it would be a table with no writer.
+--    built — without a named owner authorised to relax a suppression, it
+--    would be a table with no writer.
 SELECT p.person_id, g.rule_name,
        jsonb_build_object('company', c.primary_domain,
                           'stage', g.stage,
